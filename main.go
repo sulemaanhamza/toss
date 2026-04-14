@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +28,75 @@ const (
 	maxItems      = 64
 	maxFileSize   = 100 << 20
 )
+
+// --- config ---
+
+type config struct {
+	Key string `json:"key,omitempty"`
+}
+
+func configDir() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		dir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(dir, "toss")
+}
+
+func configPath() string { return filepath.Join(configDir(), "config.json") }
+
+func loadConfig() config {
+	var cfg config
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return cfg
+	}
+	json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveConfig(cfg config) error {
+	dir := configDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	return os.WriteFile(configPath(), data, 0600)
+}
+
+func getKey() string {
+	if k := os.Getenv("TOSS_KEY"); k != "" {
+		return k
+	}
+	return loadConfig().Key
+}
+
+func configure() {
+	cfg := loadConfig()
+	if cfg.Key != "" {
+		fmt.Println("current: key is set")
+	} else {
+		fmt.Println("current: no key")
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("enter shared key (leave empty to remove): ")
+	key, _ := reader.ReadString('\n')
+	key = strings.TrimSpace(key)
+
+	cfg.Key = key
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if key == "" {
+		fmt.Println("key removed — auth disabled")
+	} else {
+		fmt.Printf("saved to %s\n", configPath())
+		fmt.Println("use the same key on all your devices.")
+	}
+}
 
 // --- store ---
 
@@ -157,6 +228,24 @@ func discover() string {
 	return host + ":" + port
 }
 
+// --- auth middleware ---
+
+func withAuth(next http.Handler) http.Handler {
+	key := getKey()
+	if key == "" {
+		return next
+	}
+	expected := []byte("Bearer " + key)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		provided := []byte(r.Header.Get("Authorization"))
+		if subtle.ConstantTimeCompare(provided, expected) != 1 {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // --- HTTP handlers ---
 
 func handleItems(w http.ResponseWriter, r *http.Request) {
@@ -280,11 +369,39 @@ func serve() {
 	for _, ip := range localIPs() {
 		fmt.Printf("  http://%s:%s\n", ip, port)
 	}
-	fmt.Println("\nauto-discovery enabled")
+	if key := getKey(); key != "" {
+		fmt.Println("\nauth: enabled")
+	} else {
+		fmt.Println("\nauth: disabled (run toss config to set a key)")
+	}
+	fmt.Println("auto-discovery enabled")
 	fmt.Printf("or set manually: export TOSS_HOST=<ip>:%s\n\n", port)
 
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	if err := http.ListenAndServe(":"+port, withAuth(mux)); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// --- HTTP client ---
+
+func doReq(method, url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if key := getKey(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+func checkResp(resp *http.Response) {
+	if resp.StatusCode == 401 {
+		fmt.Fprintln(os.Stderr, "error: wrong key — run toss config")
 		os.Exit(1)
 	}
 }
@@ -352,12 +469,13 @@ func paste() {
 }
 
 func copyLatest() {
-	resp, err := http.Get(serverURL() + "/api/latest")
+	resp, err := doReq("GET", serverURL()+"/api/latest", "", nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
+	checkResp(resp)
 	if resp.StatusCode == 404 {
 		fmt.Fprintln(os.Stderr, "no items yet")
 		os.Exit(1)
@@ -397,7 +515,8 @@ func watch() {
 	fmt.Fprintf(os.Stderr, "watching %s\n", url)
 
 	lastID := 0
-	if resp, err := http.Get(url + "/api/items"); err == nil {
+	if resp, err := doReq("GET", url+"/api/items", "", nil); err == nil {
+		checkResp(resp)
 		var items []item
 		json.NewDecoder(resp.Body).Decode(&items)
 		resp.Body.Close()
@@ -410,10 +529,11 @@ func watch() {
 
 	for {
 		time.Sleep(time.Second)
-		resp, err := http.Get(url + "/api/items")
+		resp, err := doReq("GET", url+"/api/items", "", nil)
 		if err != nil {
 			continue
 		}
+		checkResp(resp)
 		var items []item
 		json.NewDecoder(resp.Body).Decode(&items)
 		resp.Body.Close()
@@ -451,12 +571,13 @@ func serverURL() string {
 }
 
 func sendText(text string) {
-	resp, err := http.Post(serverURL()+"/api/text", "text/plain", strings.NewReader(text))
+	resp, err := doReq("POST", serverURL()+"/api/text", "text/plain", strings.NewReader(text))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
+	checkResp(resp)
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
 		fmt.Fprintf(os.Stderr, "error: %s\n", b)
@@ -483,12 +604,13 @@ func sendFile(path string) {
 	io.Copy(part, file)
 	w.Close()
 
-	resp, err := http.Post(serverURL()+"/api/file", w.FormDataContentType(), &buf)
+	resp, err := doReq("POST", serverURL()+"/api/file", w.FormDataContentType(), &buf)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
+	checkResp(resp)
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
 		fmt.Fprintf(os.Stderr, "error: %s\n", b)
@@ -498,12 +620,13 @@ func sendFile(path string) {
 }
 
 func getLatest() {
-	resp, err := http.Get(serverURL() + "/api/latest")
+	resp, err := doReq("GET", serverURL()+"/api/latest", "", nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
+	checkResp(resp)
 	if resp.StatusCode == 404 {
 		fmt.Fprintln(os.Stderr, "no items yet")
 		os.Exit(1)
@@ -544,6 +667,7 @@ usage:
   toss paste              send clipboard contents
   toss copy               copy latest to clipboard
   toss watch              watch for new items
+  toss config             set shared key for auth
 
 server is auto-discovered on the local network.
 override with: export TOSS_HOST=<ip>:9090
@@ -576,6 +700,8 @@ func main() {
 		copyLatest()
 	case "watch":
 		watch()
+	case "config":
+		configure()
 	case "-h", "--help", "help":
 		printUsage()
 	default:

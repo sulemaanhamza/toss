@@ -157,6 +157,66 @@ toss watch >> received.txt            # log all incoming text
 toss watch 2>/dev/null                # text only, suppress file notices
 ```
 
+### `toss config`
+
+Sets a shared key for authentication. Run this on every device that needs access.
+
+```bash
+$ toss config
+current: no key
+enter shared key (leave empty to remove): ********
+saved to ~/.config/toss/config.json
+use the same key on all your devices.
+```
+
+Once set, the key is stored locally and sent automatically with every request. The server rejects any request with a missing or wrong key.
+
+To remove auth:
+
+```bash
+$ toss config
+current: key is set
+enter shared key (leave empty to remove):
+key removed — auth disabled
+```
+
+The `TOSS_KEY` environment variable can also be used and takes priority over the config file.
+
+---
+
+## Authentication
+
+```
+Device A                             Device B
+┌──────────────┐                     ┌──────────────┐
+│ toss config  │                     │ toss config  │
+│ key: s3cret  │                     │ key: s3cret  │
+│              │                     │              │
+│ config.json  │                     │ config.json  │
+└──────┬───────┘                     └──────┬───────┘
+       │                                    │
+       │   Authorization: Bearer s3cret     │
+       ├───────────────────────────────────→ │
+       │                          200 OK ←──┤
+       │                                    │
+       │   Authorization: Bearer wrong      │
+       ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ → │
+       │                     401 Denied ←──┤
+```
+
+- **Optional** — if no key is set, toss works without auth (open access)
+- **Shared key** — same key on all devices, stored in `~/.config/toss/config.json`
+- **Constant-time comparison** — prevents timing attacks
+- **`TOSS_KEY` env var** — overrides the config file, useful for scripts
+- **No encryption** — the key protects access, not the data in transit. For a trusted LAN this is fine. Do not use on public networks.
+
+Config file location:
+| OS      | Path                                        |
+|---------|---------------------------------------------|
+| macOS   | `~/Library/Application Support/toss/config.json` |
+| Linux   | `~/.config/toss/config.json`                |
+| Windows | `%AppData%\toss\config.json`                |
+
 ---
 
 ## How auto-discovery works
@@ -226,7 +286,7 @@ Clipboard commands use native OS tools:
 Linux users need `xclip` or `xsel` installed:
 
 ```bash
-sudo apt install xclip       # Debian/Ubuntu/Pop!_OS
+sudo apt install xclip       # Debian/Ubuntu
 sudo pacman -S xclip         # Arch
 sudo dnf install xclip       # Fedora
 ```
@@ -239,6 +299,7 @@ sudo dnf install xclip       # Fedora
 |-------------|----------|--------------------------------|-----------------|
 | `TOSS_HOST` | client   | Server address to connect to   | auto-discovered |
 | `TOSS_PORT` | server   | Port to listen on              | `9090`          |
+| `TOSS_KEY`  | both     | Shared auth key (overrides config) | none        |
 
 ---
 
@@ -272,11 +333,10 @@ git push origin v0.3.0
 
 Toss is designed for **trusted local networks only**.
 
-- No authentication
-- No encryption
-- No access control
-
-Do not run it on untrusted or public networks.
+- **Authentication** is available via shared key (`toss config`) but optional
+- **No encryption** — traffic is plaintext HTTP
+- Use a shared key on any network where others might be present
+- Do not expose toss to the public internet
 
 ---
 
