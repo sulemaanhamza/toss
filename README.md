@@ -4,7 +4,7 @@ Share text and files between your devices over the local network.
 No accounts. No pairing. No config. Just toss it.
 
 ```
-MacBook A                         Pop!_OS Laptop
+Device A                          Device B
 ┌────────────────────┐            ┌────────────────────┐
 │                    │            │                    │
 │  toss "hey there"  │───────────│  toss get          │
