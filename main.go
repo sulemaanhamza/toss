@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,22 +10,24 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-//go:embed index.html
-var indexHTML string
-
 const (
-	defaultPort = "9090"
-	maxItems    = 64
-	maxFileSize = 100 << 20
+	defaultPort   = "9090"
+	discoveryPort = "9090"
+	maxItems      = 64
+	maxFileSize   = 100 << 20
 )
+
+// --- store ---
 
 type item struct {
 	ID        int       `json:"id"`
@@ -107,12 +108,56 @@ func (s *store) filePath(id int) string {
 
 func (s *store) cleanup() { os.RemoveAll(s.dataDir) }
 
-// --- HTTP handlers ---
+// --- discovery ---
 
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, indexHTML)
+func startDiscovery(httpPort string) {
+	addr, err := net.ResolveUDPAddr("udp4", ":"+discoveryPort)
+	if err != nil {
+		return
+	}
+	conn, err := net.ListenUDP("udp4", addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	buf := make([]byte, 16)
+	for {
+		n, remote, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		if string(buf[:n]) == "TOSS?" {
+			conn.WriteToUDP([]byte("TOSS:"+httpPort), remote)
+		}
+	}
 }
+
+func discover() string {
+	conn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(time.Second))
+
+	dst, _ := net.ResolveUDPAddr("udp4", "255.255.255.255:"+discoveryPort)
+	conn.WriteTo([]byte("TOSS?"), dst)
+
+	buf := make([]byte, 32)
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		return ""
+	}
+	msg := string(buf[:n])
+	if !strings.HasPrefix(msg, "TOSS:") {
+		return ""
+	}
+	port := strings.TrimPrefix(msg, "TOSS:")
+	host, _, _ := net.SplitHostPort(addr.String())
+	return host + ":" + port
+}
+
+// --- HTTP handlers ---
 
 func handleItems(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -222,8 +267,9 @@ func serve() {
 		os.Exit(0)
 	}()
 
+	go startDiscovery(port)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", handleIndex)
 	mux.HandleFunc("GET /api/items", handleItems)
 	mux.HandleFunc("POST /api/text", handleText)
 	mux.HandleFunc("POST /api/file", handleFile)
@@ -234,11 +280,156 @@ func serve() {
 	for _, ip := range localIPs() {
 		fmt.Printf("  http://%s:%s\n", ip, port)
 	}
-	fmt.Printf("\non other machines:\n  export TOSS_HOST=<ip>:%s\n\n", port)
+	fmt.Println("\nauto-discovery enabled")
+	fmt.Printf("or set manually: export TOSS_HOST=<ip>:%s\n\n", port)
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// --- clipboard ---
+
+func clipRead() (string, error) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbpaste")
+	case "linux":
+		if p, err := exec.LookPath("xclip"); err == nil {
+			cmd = exec.Command(p, "-selection", "clipboard", "-o")
+		} else if p, err := exec.LookPath("xsel"); err == nil {
+			cmd = exec.Command(p, "--clipboard", "--output")
+		} else {
+			return "", fmt.Errorf("install xclip or xsel")
+		}
+	case "windows":
+		cmd = exec.Command("powershell", "-command", "Get-Clipboard")
+	default:
+		return "", fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(out), "\r\n"), nil
+}
+
+func clipWrite(text string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "linux":
+		if p, err := exec.LookPath("xclip"); err == nil {
+			cmd = exec.Command(p, "-selection", "clipboard")
+		} else if p, err := exec.LookPath("xsel"); err == nil {
+			cmd = exec.Command(p, "--clipboard", "--input")
+		} else {
+			return fmt.Errorf("install xclip or xsel")
+		}
+	case "windows":
+		cmd = exec.Command("clip")
+	default:
+		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+func paste() {
+	text, err := clipRead()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if text == "" {
+		fmt.Fprintln(os.Stderr, "clipboard is empty")
+		os.Exit(1)
+	}
+	sendText(text)
+}
+
+func copyLatest() {
+	resp, err := http.Get(serverURL() + "/api/latest")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		fmt.Fprintln(os.Stderr, "no items yet")
+		os.Exit(1)
+	}
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		fmt.Fprintln(os.Stderr, "latest is a file — use toss get")
+		os.Exit(1)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if err := clipWrite(text); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	preview := text
+	if len(preview) > 60 {
+		preview = preview[:60] + "..."
+	}
+	fmt.Fprintf(os.Stderr, "copied: %s\n", preview)
+}
+
+// --- watch ---
+
+func formatSize(b int64) string {
+	switch {
+	case b < 1024:
+		return fmt.Sprintf("%d B", b)
+	case b < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
+	}
+}
+
+func watch() {
+	url := serverURL()
+	fmt.Fprintf(os.Stderr, "watching %s\n", url)
+
+	lastID := 0
+	if resp, err := http.Get(url + "/api/items"); err == nil {
+		var items []item
+		json.NewDecoder(resp.Body).Decode(&items)
+		resp.Body.Close()
+		for _, it := range items {
+			if it.ID > lastID {
+				lastID = it.ID
+			}
+		}
+	}
+
+	for {
+		time.Sleep(time.Second)
+		resp, err := http.Get(url + "/api/items")
+		if err != nil {
+			continue
+		}
+		var items []item
+		json.NewDecoder(resp.Body).Decode(&items)
+		resp.Body.Close()
+
+		for _, it := range items {
+			if it.ID <= lastID {
+				continue
+			}
+			lastID = it.ID
+			switch it.Type {
+			case "text":
+				fmt.Println(it.Content)
+			case "file":
+				fmt.Fprintf(os.Stderr, "file: %s (%s)\n", it.Filename, formatSize(it.Size))
+			}
+		}
 	}
 }
 
@@ -247,7 +438,11 @@ func serve() {
 func serverURL() string {
 	host := os.Getenv("TOSS_HOST")
 	if host == "" {
-		host = "localhost:" + defaultPort
+		if found := discover(); found != "" {
+			host = found
+		} else {
+			host = "localhost:" + defaultPort
+		}
 	}
 	if !strings.HasPrefix(host, "http") {
 		host = "http://" + host
@@ -258,7 +453,7 @@ func serverURL() string {
 func sendText(text string) {
 	resp, err := http.Post(serverURL()+"/api/text", "text/plain", strings.NewReader(text))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot reach server at %s\nstart with: toss serve\n", serverURL())
+		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -290,7 +485,7 @@ func sendFile(path string) {
 
 	resp, err := http.Post(serverURL()+"/api/file", w.FormDataContentType(), &buf)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot reach server at %s\nstart with: toss serve\n", serverURL())
+		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -305,7 +500,7 @@ func sendFile(path string) {
 func getLatest() {
 	resp, err := http.Get(serverURL() + "/api/latest")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot reach server at %s\nstart with: toss serve\n", serverURL())
+		fmt.Fprintf(os.Stderr, "error: cannot reach server\nstart with: toss serve\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -346,10 +541,12 @@ usage:
   toss ./file.png         send a file
   echo "hi" | toss        pipe text
   toss get                get latest item
+  toss paste              send clipboard contents
+  toss copy               copy latest to clipboard
+  toss watch              watch for new items
 
-env:
-  TOSS_HOST  server address (default: localhost:9090)
-  TOSS_PORT  server port (default: 9090)
+server is auto-discovered on the local network.
+override with: export TOSS_HOST=<ip>:9090
 `)
 }
 
@@ -373,6 +570,12 @@ func main() {
 		serve()
 	case "get":
 		getLatest()
+	case "paste":
+		paste()
+	case "copy":
+		copyLatest()
+	case "watch":
+		watch()
 	case "-h", "--help", "help":
 		printUsage()
 	default:

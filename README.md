@@ -2,13 +2,13 @@
 
 Share text and files across devices on your local network. No setup, no accounts, no pairing.
 
-One binary. Works from terminal or browser. macOS, Linux, Windows.
+One binary. CLI only. macOS, Linux, Windows.
 
 ## Install
 
 ### Download
 
-Grab the latest binary from [Releases](https://github.com/sulemaanhamza/toss/releases) for your platform.
+Grab the latest binary from [Releases](https://github.com/sulemaanhamza/toss/releases).
 
 ### From source
 
@@ -30,57 +30,67 @@ Start the server on any machine:
 
 ```bash
 toss serve
-# toss running on :9090
-#
-#   http://192.168.1.50:9090
-#
-# on other machines:
-#   export TOSS_HOST=192.168.1.50:9090
 ```
 
-From any other machine on the same network:
+Other devices find the server automatically via LAN discovery — no config needed:
 
 ```bash
-export TOSS_HOST=192.168.1.50:9090
-
-# send text
-toss "here are the meeting notes"
-
-# send a file
-toss ./report.pdf
-
-# pipe into it
-cat config.yaml | toss
-
-# get the latest item
-toss get
+toss "meeting notes: check the API docs"     # send text
+toss ./report.pdf                             # send a file
+cat config.yaml | toss                        # pipe text
+toss get                                      # get latest item
+toss paste                                    # send clipboard
+toss copy                                     # copy latest to clipboard
+toss watch                                    # live stream incoming items
 ```
 
-Or open `http://192.168.1.50:9090` in any browser for the web UI.
+### Clipboard
 
-## Web UI
+```bash
+# Copy some text on your macbook, then:
+toss paste            # sends clipboard contents to server
 
-The built-in web interface supports:
+# On another machine:
+toss copy             # copies latest text to your clipboard
+```
 
-- Paste and send text
-- Drag-and-drop file upload
-- Copy text / download files
-- Auto-refreshes every 2 seconds
-- Dark mode (follows system preference)
+Uses native tools: `pbcopy`/`pbpaste` (macOS), `xclip`/`xsel` (Linux), `clip`/PowerShell (Windows).
+
+Linux users: install `xclip` or `xsel` (`sudo apt install xclip`).
+
+### Watch mode
+
+```bash
+toss watch
+```
+
+Streams incoming items in real time. Text prints to stdout, file notifications to stderr.
+
+Pipe-friendly:
+
+```bash
+toss watch >> received.txt     # log all received text
+```
+
+### Auto-discovery
+
+The server broadcasts its presence via UDP on the local network. Clients find it automatically — no need to set IPs or environment variables.
+
+To override: `export TOSS_HOST=192.168.1.50:9090`
 
 ## How it works
 
-- `toss serve` starts an HTTP server on port 9090
-- Other devices send/receive via CLI or browser
+- `toss serve` starts an HTTP server and a UDP discovery beacon
+- Clients auto-discover the server on the local network
 - Text is stored in memory, files in a temp directory
 - Last 64 items are kept, cleaned up on exit
-- Zero dependencies beyond Go's standard library
+- Zero external dependencies
 
 ## Environment variables
 
 | Variable    | Description              | Default          |
 |-------------|--------------------------|------------------|
-| `TOSS_HOST` | Server address (client)  | `localhost:9090` |
+| `TOSS_HOST` | Server address (client)  | auto-discovered  |
 | `TOSS_PORT` | Server port (server)     | `9090`           |
 
 ## Build for all platforms
