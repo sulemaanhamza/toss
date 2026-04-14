@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>toss</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#fafafa;--card:#fff;--border:#e0e0e0;--text:#111;--muted:#888}
+@media(prefers-color-scheme:dark){
+:root{--bg:#111;--card:#1a1a1a;--border:#2a2a2a;--text:#e0e0e0;--muted:#666}
+}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);max-width:640px;margin:0 auto;padding:24px 16px}
+h1{font-size:1.25rem;margin-bottom:20px;font-weight:600}
+textarea{width:100%;height:80px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);font-family:inherit;font-size:14px;resize:vertical;outline:none}
+textarea:focus{border-color:var(--muted)}
+.row{display:flex;gap:8px;margin-top:8px;align-items:center}
+.hint{font-size:11px;color:var(--muted)}
+button{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);cursor:pointer;font-size:13px}
+button:hover{border-color:var(--muted)}
+.drop{border:2px dashed var(--border);border-radius:6px;padding:16px;text-align:center;margin:16px 0;color:var(--muted);font-size:13px;cursor:pointer;position:relative}
+.drop.over{border-color:var(--muted)}
+.drop input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.items{display:flex;flex-direction:column;gap:8px}
+.item{padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card)}
+.item pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,monospace;font-size:13px;margin:0;line-height:1.5}
+.item .meta{font-size:11px;color:var(--muted);margin-top:6px}
+.item .actions{margin-top:6px}
+.item .actions button{font-size:11px;padding:3px 8px}
+.item .actions a{text-decoration:none}
+.fname{font-size:14px}
+</style>
+</head>
+<body>
+<h1>toss</h1>
+<textarea id="text" placeholder="paste text here..." spellcheck="false"></textarea>
+<div class="row">
+<button onclick="send()">send</button>
+<span class="hint">ctrl+enter</span>
+</div>
+<div class="drop" id="drop">
+drop a file or click to browse
+<input type="file" id="file" onchange="upload(this.files[0])">
+</div>
+<div class="items" id="items"></div>
+<script>
+const $=id=>document.getElementById(id);
+$('text').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();send()}});
+const drop=$('drop');
+drop.addEventListener('dragover',e=>{e.preventDefault();drop.classList.add('over')});
+drop.addEventListener('dragleave',()=>drop.classList.remove('over'));
+drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('over');if(e.dataTransfer.files.length)upload(e.dataTransfer.files[0])});
+
+async function send(){
+const t=$('text').value.trim();
+if(!t)return;
+await fetch('/api/text',{method:'POST',body:t});
+$('text').value='';
+load();
+}
+
+async function upload(file){
+if(!file)return;
+const fd=new FormData();
+fd.append('file',file);
+await fetch('/api/file',{method:'POST',body:fd});
+$('file').value='';
+load();
+}
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function ago(d){
+const s=Math.floor((Date.now()-new Date(d))/1000);
+if(s<5)return 'just now';
+if(s<60)return s+'s ago';
+if(s<3600)return Math.floor(s/60)+'m ago';
+if(s<86400)return Math.floor(s/3600)+'h ago';
+return Math.floor(s/86400)+'d ago';
+}
+
+function sz(b){
+if(b<1024)return b+' B';
+if(b<1048576)return(b/1024).toFixed(1)+' KB';
+return(b/1048576).toFixed(1)+' MB';
+}
+
+let items=[];
+
+async function load(){
+try{
+const r=await fetch('/api/items');
+items=((await r.json())||[]).slice().reverse();
+$('items').innerHTML=items.map((it,i)=>it.type==='text'
+?`<div class="item"><pre>${esc(it.content)}</pre><div class="meta">${ago(it.created_at)} &middot; ${sz(it.size)}</div><div class="actions"><button onclick="cp(${i},this)">copy</button></div></div>`
+:`<div class="item"><div class="fname">${esc(it.filename)}</div><div class="meta">${ago(it.created_at)} &middot; ${sz(it.size)}</div><div class="actions"><a href="/api/download/${it.id}"><button>download</button></a></div></div>`
+).join('');
+}catch(e){}
+}
+
+function cp(i,btn){
+const text=items[i].content;
+if(navigator.clipboard&&window.isSecureContext){
+navigator.clipboard.writeText(text);
+}else{
+const ta=document.createElement('textarea');
+ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';
+document.body.appendChild(ta);ta.select();document.execCommand('copy');
+document.body.removeChild(ta);
+}
+btn.textContent='copied!';
+setTimeout(()=>btn.textContent='copy',1000);
+}
+
+load();
+setInterval(load,2000);
+</script>
+</body>
+</html>
