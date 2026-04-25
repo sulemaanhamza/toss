@@ -166,18 +166,10 @@ Pipe-friendly — text goes to stdout, file notifications to stderr:
 ```bash
 toss watch >> received.txt            # log all incoming text
 toss watch 2>/dev/null                # text only, suppress file notices
+toss watch --notify                   # also show desktop notifications
 ```
 
-### `toss notify`
-
-Desktop notifications for new items. Uses macOS Notification Center or `notify-send` on Linux.
-
-```bash
-$ toss notify
-notifications enabled — watching http://192.168.1.50:9090
-```
-
-Messages and file arrivals pop up as native notifications — no terminal needed.
+Add `--notify` to get native OS notifications (macOS Notification Center / `notify-send` on Linux) alongside terminal output.
 
 ### `toss chat`
 
@@ -191,6 +183,12 @@ type a message and press enter. ctrl+c to exit.
 > hey, deploy is done
 > ← nice, checking now
 > ← file: report.pdf (2.4 MB)
+```
+
+Add `--notify` for desktop notifications on incoming messages:
+
+```bash
+toss chat --notify
 ```
 
 ### `toss update`

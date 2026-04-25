@@ -666,7 +666,17 @@ func formatSize(b int64) string {
 	}
 }
 
-func watch() {
+func sendNotification(title, body string) {
+	switch runtime.GOOS {
+	case "darwin":
+		script := fmt.Sprintf(`display notification %q with title %q`, body, title)
+		exec.Command("osascript", "-e", script).Run()
+	case "linux":
+		exec.Command("notify-send", title, body).Run()
+	}
+}
+
+func watch(withNotify bool) {
 	url := serverURL()
 	fmt.Fprintf(os.Stderr, "watching %s\n", url)
 
@@ -702,63 +712,14 @@ func watch() {
 			switch it.Type {
 			case "text":
 				fmt.Println(it.Content)
+				if withNotify {
+					sendNotification("toss", it.Content)
+				}
 			case "file":
 				fmt.Fprintf(os.Stderr, "file: %s (%s)\n", it.Filename, formatSize(it.Size))
-			}
-		}
-	}
-}
-
-// --- notifications ---
-
-func sendNotification(title, body string) {
-	switch runtime.GOOS {
-	case "darwin":
-		script := fmt.Sprintf(`display notification %q with title %q`, body, title)
-		exec.Command("osascript", "-e", script).Run()
-	case "linux":
-		exec.Command("notify-send", title, body).Run()
-	}
-}
-
-func notify() {
-	url := serverURL()
-	fmt.Fprintf(os.Stderr, "notifications enabled — watching %s\n", url)
-
-	lastID := 0
-	if resp, err := doReq("GET", url+"/api/items", "", nil); err == nil {
-		checkResp(resp)
-		var items []item
-		json.NewDecoder(resp.Body).Decode(&items)
-		resp.Body.Close()
-		for _, it := range items {
-			if it.ID > lastID {
-				lastID = it.ID
-			}
-		}
-	}
-
-	for {
-		time.Sleep(time.Second)
-		resp, err := doReq("GET", url+"/api/items", "", nil)
-		if err != nil {
-			continue
-		}
-		checkResp(resp)
-		var items []item
-		json.NewDecoder(resp.Body).Decode(&items)
-		resp.Body.Close()
-
-		for _, it := range items {
-			if it.ID <= lastID {
-				continue
-			}
-			lastID = it.ID
-			switch it.Type {
-			case "text":
-				sendNotification("toss", it.Content)
-			case "file":
-				sendNotification("toss", fmt.Sprintf("file: %s (%s)", it.Filename, formatSize(it.Size)))
+				if withNotify {
+					sendNotification("toss", fmt.Sprintf("file: %s (%s)", it.Filename, formatSize(it.Size)))
+				}
 			}
 		}
 	}
@@ -874,7 +835,7 @@ func getLatest() {
 
 // --- chat ---
 
-func chat() {
+func chat(withNotify bool) {
 	url := serverURL()
 	fmt.Fprintf(os.Stderr, "connected to %s\ntype a message and press enter. ctrl+c to exit.\n\n", url)
 
@@ -913,8 +874,14 @@ func chat() {
 				switch it.Type {
 				case "text":
 					fmt.Printf("\r← %s\n> ", it.Content)
+					if withNotify {
+						sendNotification("toss", it.Content)
+					}
 				case "file":
 					fmt.Printf("\r← file: %s (%s)\n> ", it.Filename, formatSize(it.Size))
+					if withNotify {
+						sendNotification("toss", fmt.Sprintf("file: %s (%s)", it.Filename, formatSize(it.Size)))
+					}
 				}
 			}
 			mu.Unlock()
@@ -1210,8 +1177,9 @@ usage:
   toss paste              send clipboard contents
   toss copy               copy latest to clipboard
   toss watch              stream new items to terminal
-  toss notify             desktop notifications for new items
+  toss watch --notify     also show desktop notifications
   toss chat               interactive two-way chat
+  toss chat --notify      also show desktop notifications
   toss config             set shared key for auth
   toss serve              start server (auto-starts if needed)
   toss serve --install    run server on login (launchd/systemd)
@@ -1261,11 +1229,9 @@ func main() {
 	case "copy":
 		copyLatest()
 	case "watch":
-		watch()
-	case "notify":
-		notify()
+		watch(len(os.Args) > 2 && os.Args[2] == "--notify")
 	case "chat":
-		chat()
+		chat(len(os.Args) > 2 && os.Args[2] == "--notify")
 	case "config":
 		configure()
 	case "update":
