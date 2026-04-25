@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -21,6 +24,8 @@ import (
 	"sync"
 	"time"
 )
+
+var version = "dev"
 
 const (
 	defaultPort   = "9090"
@@ -226,6 +231,157 @@ func discover() string {
 	port := strings.TrimPrefix(msg, "TOSS:")
 	host, _, _ := net.SplitHostPort(addr.String())
 	return host + ":" + port
+}
+
+// --- service ---
+
+func servicePath() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", "com.toss.server.plist")
+	case "linux":
+		return filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", "toss.service")
+	default:
+		return ""
+	}
+}
+
+func serviceInstall() {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	exe, _ = filepath.EvalSymlinks(exe)
+
+	switch runtime.GOOS {
+	case "darwin":
+		plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.toss.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>%s</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/toss.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/toss.log</string>
+</dict>
+</plist>`, exe)
+		path := servicePath()
+		dir := filepath.Dir(path)
+		os.MkdirAll(dir, 0755)
+		if err := os.WriteFile(path, []byte(plist), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		cmd := exec.Command("launchctl", "load", path)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "error starting service: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("installed: %s\n", path)
+		fmt.Println("toss server will start on login")
+
+	case "linux":
+		unit := fmt.Sprintf(`[Unit]
+Description=toss server
+After=network.target
+
+[Service]
+ExecStart=%s serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`, exe)
+		path := servicePath()
+		dir := filepath.Dir(path)
+		os.MkdirAll(dir, 0755)
+		if err := os.WriteFile(path, []byte(unit), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		exec.Command("systemctl", "--user", "daemon-reload").Run()
+		cmd := exec.Command("systemctl", "--user", "enable", "--now", "toss")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "error starting service: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("installed: %s\n", path)
+		fmt.Println("toss server will start on login")
+
+	default:
+		fmt.Fprintf(os.Stderr, "service install not supported on %s\n", runtime.GOOS)
+		os.Exit(1)
+	}
+}
+
+func serviceUninstall() {
+	path := servicePath()
+	if path == "" {
+		fmt.Fprintf(os.Stderr, "service not supported on %s\n", runtime.GOOS)
+		os.Exit(1)
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Println("no service installed")
+		return
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		exec.Command("launchctl", "unload", path).Run()
+	case "linux":
+		exec.Command("systemctl", "--user", "disable", "--now", "toss").Run()
+	}
+	os.Remove(path)
+	if runtime.GOOS == "linux" {
+		exec.Command("systemctl", "--user", "daemon-reload").Run()
+	}
+	fmt.Println("service removed")
+}
+
+// --- auto-serve ---
+
+func autoServe() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return ""
+	}
+	cmd := exec.Command(exe, "serve")
+	cmd.Stdout = devnull
+	cmd.Stderr = devnull
+	if err := cmd.Start(); err != nil {
+		devnull.Close()
+		return ""
+	}
+	devnull.Close()
+	go cmd.Wait()
+
+	for i := 0; i < 10; i++ {
+		time.Sleep(200 * time.Millisecond)
+		if found := discover(); found != "" {
+			return found
+		}
+	}
+	return ""
 }
 
 // --- auth middleware ---
@@ -553,6 +709,61 @@ func watch() {
 	}
 }
 
+// --- notifications ---
+
+func sendNotification(title, body string) {
+	switch runtime.GOOS {
+	case "darwin":
+		script := fmt.Sprintf(`display notification %q with title %q`, body, title)
+		exec.Command("osascript", "-e", script).Run()
+	case "linux":
+		exec.Command("notify-send", title, body).Run()
+	}
+}
+
+func notify() {
+	url := serverURL()
+	fmt.Fprintf(os.Stderr, "notifications enabled — watching %s\n", url)
+
+	lastID := 0
+	if resp, err := doReq("GET", url+"/api/items", "", nil); err == nil {
+		checkResp(resp)
+		var items []item
+		json.NewDecoder(resp.Body).Decode(&items)
+		resp.Body.Close()
+		for _, it := range items {
+			if it.ID > lastID {
+				lastID = it.ID
+			}
+		}
+	}
+
+	for {
+		time.Sleep(time.Second)
+		resp, err := doReq("GET", url+"/api/items", "", nil)
+		if err != nil {
+			continue
+		}
+		checkResp(resp)
+		var items []item
+		json.NewDecoder(resp.Body).Decode(&items)
+		resp.Body.Close()
+
+		for _, it := range items {
+			if it.ID <= lastID {
+				continue
+			}
+			lastID = it.ID
+			switch it.Type {
+			case "text":
+				sendNotification("toss", it.Content)
+			case "file":
+				sendNotification("toss", fmt.Sprintf("file: %s (%s)", it.Filename, formatSize(it.Size)))
+			}
+		}
+	}
+}
+
 // --- client ---
 
 func serverURL() string {
@@ -561,7 +772,13 @@ func serverURL() string {
 		if found := discover(); found != "" {
 			host = found
 		} else {
-			host = "localhost:" + defaultPort
+			fmt.Fprintf(os.Stderr, "no server found — starting one in background\n")
+			if found := autoServe(); found != "" {
+				host = found
+			} else {
+				fmt.Fprintf(os.Stderr, "error: could not start server\nstart manually with: toss serve\n")
+				os.Exit(1)
+			}
 		}
 	}
 	if !strings.HasPrefix(host, "http") {
@@ -655,6 +872,261 @@ func getLatest() {
 	}
 }
 
+// --- chat ---
+
+func chat() {
+	url := serverURL()
+	fmt.Fprintf(os.Stderr, "connected to %s\ntype a message and press enter. ctrl+c to exit.\n\n", url)
+
+	var mu sync.Mutex
+	lastID := 0
+
+	if resp, err := doReq("GET", url+"/api/items", "", nil); err == nil {
+		checkResp(resp)
+		var items []item
+		json.NewDecoder(resp.Body).Decode(&items)
+		resp.Body.Close()
+		for _, it := range items {
+			if it.ID > lastID {
+				lastID = it.ID
+			}
+		}
+	}
+
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			resp, err := doReq("GET", url+"/api/items", "", nil)
+			if err != nil {
+				continue
+			}
+			var items []item
+			json.NewDecoder(resp.Body).Decode(&items)
+			resp.Body.Close()
+
+			mu.Lock()
+			for _, it := range items {
+				if it.ID <= lastID {
+					continue
+				}
+				lastID = it.ID
+				switch it.Type {
+				case "text":
+					fmt.Printf("\r← %s\n> ", it.Content)
+				case "file":
+					fmt.Printf("\r← file: %s (%s)\n> ", it.Filename, formatSize(it.Size))
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+
+	fmt.Print("> ")
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		text := strings.TrimSpace(scanner.Text())
+		if text == "" {
+			fmt.Print("> ")
+			continue
+		}
+		resp, err := doReq("POST", url+"/api/text", "text/plain", strings.NewReader(text))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\rerror: %v\n> ", err)
+			continue
+		}
+		var sent item
+		json.NewDecoder(resp.Body).Decode(&sent)
+		resp.Body.Close()
+		mu.Lock()
+		if sent.ID > lastID {
+			lastID = sent.ID
+		}
+		mu.Unlock()
+		fmt.Print("> ")
+	}
+}
+
+// --- update ---
+
+func extractTarGz(archivePath, destDir, target string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if filepath.Base(hdr.Name) == target {
+			out, err := os.OpenFile(filepath.Join(destDir, target), os.O_CREATE|os.O_WRONLY, 0755)
+			if err != nil {
+				return err
+			}
+			io.Copy(out, tr)
+			out.Close()
+			return nil
+		}
+	}
+	return fmt.Errorf("binary not found in archive")
+}
+
+func extractZip(archivePath, destDir, target string) error {
+	r, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	for _, f := range r.File {
+		if filepath.Base(f.Name) == target {
+			src, err := f.Open()
+			if err != nil {
+				return err
+			}
+			out, err := os.OpenFile(filepath.Join(destDir, target), os.O_CREATE|os.O_WRONLY, 0755)
+			if err != nil {
+				src.Close()
+				return err
+			}
+			io.Copy(out, src)
+			src.Close()
+			out.Close()
+			return nil
+		}
+	}
+	return fmt.Errorf("binary not found in archive")
+}
+
+func replaceBinary(newPath, exePath string) error {
+	if err := os.Rename(newPath, exePath); err == nil {
+		return nil
+	}
+	// cross-device: try copy (remove first to avoid "text file busy")
+	if data, err := os.ReadFile(newPath); err == nil {
+		os.Remove(exePath)
+		if err := os.WriteFile(exePath, data, 0755); err == nil {
+			return nil
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("run as administrator to update")
+	}
+	fmt.Println("need sudo to update")
+	cmd := exec.Command("sudo", "cp", newPath, exePath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	return exec.Command("sudo", "chmod", "+x", exePath).Run()
+}
+
+func update() {
+	fmt.Printf("current: %s\n", version)
+
+	resp, err := http.Get("https://api.github.com/repos/sulemaanhamza/toss/releases/latest")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	latest := release.TagName
+	if latest == "" {
+		fmt.Fprintln(os.Stderr, "error: could not find latest release")
+		os.Exit(1)
+	}
+	if latest == version {
+		fmt.Println("already up to date")
+		return
+	}
+	fmt.Printf("found %s\n", latest)
+
+	goos := runtime.GOOS
+	goarch := runtime.GOARCH
+	ver := strings.TrimPrefix(latest, "v")
+	ext := "tar.gz"
+	if goos == "windows" {
+		ext = "zip"
+	}
+	archive := fmt.Sprintf("toss_%s_%s_%s.%s", ver, goos, goarch, ext)
+	url := fmt.Sprintf("https://github.com/sulemaanhamza/toss/releases/download/%s/%s", latest, archive)
+
+	fmt.Printf("downloading %s\n", archive)
+	dlResp, err := http.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer dlResp.Body.Close()
+	if dlResp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "error: download failed (HTTP %d)\n", dlResp.StatusCode)
+		os.Exit(1)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "toss-update-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	archivePath := filepath.Join(tmpDir, archive)
+	f, err := os.Create(archivePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	io.Copy(f, dlResp.Body)
+	f.Close()
+
+	binaryName := "toss"
+	if goos == "windows" {
+		binaryName = "toss.exe"
+	}
+
+	if ext == "tar.gz" {
+		err = extractTarGz(archivePath, tmpDir, binaryName)
+	} else {
+		err = extractZip(archivePath, tmpDir, binaryName)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	exe, _ = filepath.EvalSymlinks(exe)
+
+	if err := replaceBinary(filepath.Join(tmpDir, binaryName), exe); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("updated to %s\n", latest)
+}
+
 func uninstall() {
 	exe, err := os.Executable()
 	if err != nil {
@@ -665,12 +1137,20 @@ func uninstall() {
 
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Printf("this will remove:\n")
-	fmt.Printf("  binary: %s\n", exe)
+	fmt.Printf("  binary:  %s\n", exe)
 	cfgDir := configDir()
 	hasCfg := false
 	if _, err := os.Stat(cfgDir); err == nil {
 		hasCfg = true
-		fmt.Printf("  config: %s\n", cfgDir)
+		fmt.Printf("  config:  %s\n", cfgDir)
+	}
+	svcPath := servicePath()
+	hasSvc := false
+	if svcPath != "" {
+		if _, err := os.Stat(svcPath); err == nil {
+			hasSvc = true
+			fmt.Printf("  service: %s\n", svcPath)
+		}
 	}
 	fmt.Print("\nuninstall? [y/N] ")
 	answer, _ := reader.ReadString('\n')
@@ -678,6 +1158,20 @@ func uninstall() {
 	if answer != "y" && answer != "yes" {
 		fmt.Println("cancelled")
 		return
+	}
+
+	if hasSvc {
+		switch runtime.GOOS {
+		case "darwin":
+			exec.Command("launchctl", "unload", svcPath).Run()
+		case "linux":
+			exec.Command("systemctl", "--user", "disable", "--now", "toss").Run()
+		}
+		os.Remove(svcPath)
+		if runtime.GOOS == "linux" {
+			exec.Command("systemctl", "--user", "daemon-reload").Run()
+		}
+		fmt.Printf("removed %s\n", svcPath)
 	}
 
 	if hasCfg {
@@ -709,18 +1203,23 @@ func printUsage() {
 	fmt.Print(`toss - share text and files on your local network
 
 usage:
-  toss serve              start the server
   toss "hello world"      send text
   toss ./file.png         send a file
   echo "hi" | toss        pipe text
   toss get                get latest item
   toss paste              send clipboard contents
   toss copy               copy latest to clipboard
-  toss watch              watch for new items
+  toss watch              stream new items to terminal
+  toss notify             desktop notifications for new items
+  toss chat               interactive two-way chat
   toss config             set shared key for auth
+  toss serve              start server (auto-starts if needed)
+  toss serve --install    run server on login (launchd/systemd)
+  toss serve --uninstall  remove login service
+  toss update             update to latest version
   toss uninstall          remove toss from your system
 
-server is auto-discovered on the local network.
+server auto-starts in the background when needed.
 override with: export TOSS_HOST=<ip>:9090
 `)
 }
@@ -742,7 +1241,19 @@ func main() {
 
 	switch os.Args[1] {
 	case "serve":
-		serve()
+		if len(os.Args) > 2 {
+			switch os.Args[2] {
+			case "--install":
+				serviceInstall()
+			case "--uninstall":
+				serviceUninstall()
+			default:
+				fmt.Fprintf(os.Stderr, "unknown flag: %s\n", os.Args[2])
+				os.Exit(1)
+			}
+		} else {
+			serve()
+		}
 	case "get":
 		getLatest()
 	case "paste":
@@ -751,10 +1262,18 @@ func main() {
 		copyLatest()
 	case "watch":
 		watch()
+	case "notify":
+		notify()
+	case "chat":
+		chat()
 	case "config":
 		configure()
+	case "update":
+		update()
 	case "uninstall":
 		uninstall()
+	case "-v", "--version", "version":
+		fmt.Println(version)
 	case "-h", "--help", "help":
 		printUsage()
 	default:

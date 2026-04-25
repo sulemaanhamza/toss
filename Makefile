@@ -1,7 +1,9 @@
 .PHONY: build clean all
 
+VERSION ?= dev
+
 build:
-	go build -o toss .
+	go build -ldflags "-X main.version=$(VERSION)" -o toss .
 
 all: clean
 	@mkdir -p dist

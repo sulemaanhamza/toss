@@ -49,35 +49,30 @@ make all         # builds for all platforms → dist/
 toss uninstall
 ```
 
-Removes the binary and config. That's it.
+Removes the binary, config, and service. That's it.
 
 ---
 
 ## Quick start
 
-**1. Start the server** on any one machine:
-
-```bash
-$ toss serve
-toss running on :9090
-
-  http://192.168.1.50:9090
-
-auto-discovery enabled
-or set manually: export TOSS_HOST=192.168.1.50:9090
-```
-
-**2. Send and receive** from any other machine on the same network:
+Just send something — the server starts automatically if needed:
 
 ```bash
 $ toss "deploy is done, check staging"
+no server found — starting one in background
 sent
 
 $ toss get
 deploy is done, check staging
 ```
 
-That's it. The client finds the server automatically — no IP to remember, no env vars to set.
+That's it. No server to start manually, no IP to remember, no env vars to set.
+
+For a permanent setup, install the server as a system service so it runs on login:
+
+```bash
+toss serve --install
+```
 
 ---
 
@@ -85,12 +80,16 @@ That's it. The client finds the server automatically — no IP to remember, no e
 
 ### `toss serve`
 
-Starts the server. Run this on one machine — any machine. It listens for HTTP requests on port 9090 and broadcasts its presence via UDP so clients can find it automatically.
+Starts the server. You usually don't need to run this manually — the server auto-starts in the background when you send or receive something.
 
 ```bash
-toss serve                        # default port 9090
+toss serve                        # run in foreground
+toss serve --install              # install as system service (starts on login)
+toss serve --uninstall            # remove the service
 TOSS_PORT=4444 toss serve         # custom port
 ```
+
+On macOS, `--install` creates a launchd agent. On Linux, it creates a systemd user service.
 
 ### `toss <text>`
 
@@ -169,19 +168,55 @@ toss watch >> received.txt            # log all incoming text
 toss watch 2>/dev/null                # text only, suppress file notices
 ```
 
+### `toss notify`
+
+Desktop notifications for new items. Uses macOS Notification Center or `notify-send` on Linux.
+
+```bash
+$ toss notify
+notifications enabled — watching http://192.168.1.50:9090
+```
+
+Messages and file arrivals pop up as native notifications — no terminal needed.
+
+### `toss chat`
+
+Interactive two-way chat. Send and receive in one terminal.
+
+```bash
+$ toss chat
+connected to http://192.168.1.50:9090
+type a message and press enter. ctrl+c to exit.
+
+> hey, deploy is done
+> ← nice, checking now
+> ← file: report.pdf (2.4 MB)
+```
+
+### `toss update`
+
+Updates toss to the latest version. Downloads the right binary for your platform and replaces the current one.
+
+```bash
+$ toss update
+current: v0.3.0
+found v0.4.0
+downloading toss_0.4.0_darwin_arm64.tar.gz
+updated to v0.4.0
+```
+
 ### `toss uninstall`
 
-Removes toss from your system — binary and config, done.
+Removes toss from your system — binary, config, and service.
 
 ```bash
 $ toss uninstall
 this will remove:
-  binary: /usr/local/bin/toss
-  config: /Users/you/.config/toss
+  binary:  /usr/local/bin/toss
+  config:  /Users/you/.config/toss
+  service: ~/Library/LaunchAgents/com.toss.server.plist
 
 uninstall? [y/N] y
-removed /Users/you/.config/toss
-removed /usr/local/bin/toss
 toss uninstalled
 ```
 
