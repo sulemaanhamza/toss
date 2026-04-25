@@ -22,7 +22,11 @@ Works on **macOS**, **Linux**, and **Windows**.
 
 ## Install
 
-**Download a prebuilt binary** from [Releases](https://github.com/sulemaanhamza/toss/releases).
+**One command** (macOS / Linux):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/sulemaanhamza/toss/main/install.sh | sh
+```
 
 Or install from source:
 
@@ -38,6 +42,14 @@ cd toss
 make build       # builds for your current platform
 make all         # builds for all platforms → dist/
 ```
+
+## Uninstall
+
+```bash
+toss uninstall
+```
+
+Removes the binary and config. That's it.
 
 ---
 
@@ -155,6 +167,22 @@ Pipe-friendly — text goes to stdout, file notifications to stderr:
 ```bash
 toss watch >> received.txt            # log all incoming text
 toss watch 2>/dev/null                # text only, suppress file notices
+```
+
+### `toss uninstall`
+
+Removes toss from your system — binary and config, done.
+
+```bash
+$ toss uninstall
+this will remove:
+  binary: /usr/local/bin/toss
+  config: /Users/you/.config/toss
+
+uninstall? [y/N] y
+removed /Users/you/.config/toss
+removed /usr/local/bin/toss
+toss uninstalled
 ```
 
 ### `toss config`

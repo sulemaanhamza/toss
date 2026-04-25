@@ -655,6 +655,56 @@ func getLatest() {
 	}
 }
 
+func uninstall() {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot find toss binary: %v\n", err)
+		os.Exit(1)
+	}
+	exe, _ = filepath.EvalSymlinks(exe)
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("this will remove:\n")
+	fmt.Printf("  binary: %s\n", exe)
+	cfgDir := configDir()
+	hasCfg := false
+	if _, err := os.Stat(cfgDir); err == nil {
+		hasCfg = true
+		fmt.Printf("  config: %s\n", cfgDir)
+	}
+	fmt.Print("\nuninstall? [y/N] ")
+	answer, _ := reader.ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	if answer != "y" && answer != "yes" {
+		fmt.Println("cancelled")
+		return
+	}
+
+	if hasCfg {
+		os.RemoveAll(cfgDir)
+		fmt.Printf("removed %s\n", cfgDir)
+	}
+
+	if err := os.Remove(exe); err != nil {
+		if os.IsPermission(err) {
+			fmt.Println("need sudo to remove binary")
+			cmd := exec.Command("sudo", "rm", exe)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	fmt.Printf("removed %s\n", exe)
+	fmt.Println("toss uninstalled")
+}
+
 func printUsage() {
 	fmt.Print(`toss - share text and files on your local network
 
@@ -668,6 +718,7 @@ usage:
   toss copy               copy latest to clipboard
   toss watch              watch for new items
   toss config             set shared key for auth
+  toss uninstall          remove toss from your system
 
 server is auto-discovered on the local network.
 override with: export TOSS_HOST=<ip>:9090
@@ -702,6 +753,8 @@ func main() {
 		watch()
 	case "config":
 		configure()
+	case "uninstall":
+		uninstall()
 	case "-h", "--help", "help":
 		printUsage()
 	default:
